@@ -1,0 +1,22 @@
+{
+  "last_preset": "",
+  "presets": {},
+  "size_presets": {
+    "768×1344": {
+      "w": 768,
+      "h": 1344
+    }
+  },
+  "last_size_preset": "768×1344",
+  "last_process_mode": 0,
+  "manual_crop": {
+    "crop_x": 0,
+    "crop_y": 0,
+    "crop_w": 512,
+    "crop_h": 512,
+    "after_scale": false,
+    "target_width": 768,
+    "target_height": 1344,
+    "padding_color": "black"
+  }
+}
