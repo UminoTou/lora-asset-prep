@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QRadioButton,
     QSpinBox,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -34,6 +33,20 @@ from PySide6.QtWidgets import (
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
 PRESETS_FILE = "presets.json"
+
+
+def _sorted_exclude_pick_paths(paths: list[str]) -> list[str]:
+    """多选对话框返回顺序不稳定；按路径层级与不区分大小写的文件名排序，与资源管理器中「名称」升序观感一致。"""
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for p in paths:
+        norm = os.path.normpath(p)
+        if norm not in seen:
+            seen.add(norm)
+            uniq.append(norm)
+    return sorted(uniq, key=lambda fp: tuple(part.lower() for part in Path(fp).parts))
+
+
 APP_NAME_EN = "LoRA Asset Prep"
 APP_NAME_ZH = "LoRA 素材预处理"
 WINDOW_TITLE = f"{APP_NAME_EN} — {APP_NAME_ZH}"
@@ -56,22 +69,6 @@ class AppConfig:
     recursive: bool = True
     resize_images: bool = True
     padding_color: str = "black"  # "black" | "white" | "transparent"
-
-
-@dataclass
-class ManualCropConfig:
-    source_dir: str = ""
-    crop_x: int = 0
-    crop_y: int = 0
-    crop_w: int = 512
-    crop_h: int = 512
-    use_exclude_dirs: bool = False
-    excluded_paths: list[str] = field(default_factory=list)
-    recursive: bool = True
-    after_scale: bool = False
-    target_width: int = 768
-    target_height: int = 1344
-    padding_color: str = "black"
 
 
 class Worker(QObject):
@@ -105,71 +102,56 @@ class Worker(QObject):
         return self._cancelled
 
 
-class ManualCropWorker(QObject):
-    progress = Signal(int, int)
-    log = Signal(str)
-    finished = Signal(dict)
-    failed = Signal(str)
-
-    def __init__(self, cfg: ManualCropConfig):
-        super().__init__()
-        self.cfg = cfg
-        self._cancelled = False
-
-    def cancel(self) -> None:
-        self._cancelled = True
-
-    def run(self) -> None:
+def path_matches_exclusion(path: Path, exclusions: list[Path]) -> bool:
+    """排除项可为目录（整棵跳过）或单个图片路径（仅该文件）。"""
+    try:
+        pr = path.resolve()
+    except OSError:
+        return False
+    for ex in exclusions:
         try:
-            result = process_manual_crop(self.cfg, self._emit_log, self._emit_progress, self._is_cancelled)
-            self.finished.emit(result)
-        except Exception as exc:  # pragma: no cover
-            self.failed.emit(str(exc))
-
-    def _emit_log(self, msg: str) -> None:
-        self.log.emit(msg)
-
-    def _emit_progress(self, current: int, total: int) -> None:
-        self.progress.emit(current, total)
-
-    def _is_cancelled(self) -> bool:
-        return self._cancelled
-
-
-def path_under_exclude_root(path: Path, exclude_roots: list[Path]) -> bool:
-    pr = path.resolve()
-    for er in exclude_roots:
-        try:
-            pr.relative_to(er.resolve())
-            return True
-        except ValueError:
+            er = ex.resolve()
+        except OSError:
             continue
+        if not er.exists():
+            continue
+        if er.is_file():
+            if pr == er:
+                return True
+        else:
+            if pr == er:
+                return True
+            try:
+                pr.relative_to(er)
+                return True
+            except ValueError:
+                pass
     return False
 
 
 def iter_image_files(
     source_root: Path,
     recursive: bool,
-    exclude_roots: list[Path],
+    exclusions: list[Path],
 ):
     if recursive:
         for dirpath, dirnames, filenames in os.walk(source_root, topdown=True):
             current = Path(dirpath)
-            if exclude_roots and path_under_exclude_root(current, exclude_roots):
+            if exclusions and path_matches_exclusion(current, exclusions):
                 dirnames[:] = []
                 continue
             for name in filenames:
                 p = current / name
                 if p.suffix.lower() not in IMAGE_EXTS:
                     continue
-                if exclude_roots and path_under_exclude_root(p, exclude_roots):
+                if exclusions and path_matches_exclusion(p, exclusions):
                     continue
                 yield p
     else:
         for p in source_root.iterdir():
             if not p.is_file() or p.suffix.lower() not in IMAGE_EXTS:
                 continue
-            if exclude_roots and path_under_exclude_root(p, exclude_roots):
+            if exclusions and path_matches_exclusion(p, exclusions):
                 continue
             yield p
 
@@ -250,17 +232,17 @@ def process_dataset(
     if not source_root.exists() or not source_root.is_dir():
         raise RuntimeError("素材目录不存在或不是文件夹。")
 
-    exclude_roots: list[Path] = []
+    exclusions: list[Path] = []
     if cfg.use_exclude_dirs:
         for s in cfg.excluded_paths:
             t = s.strip()
             if not t:
                 continue
             p = Path(t)
-            if p.exists() and p.is_dir():
-                exclude_roots.append(p.resolve())
+            if p.exists():
+                exclusions.append(p.resolve())
 
-    images = list(iter_image_files(source_root, cfg.recursive, exclude_roots))
+    images = list(iter_image_files(source_root, cfg.recursive, exclusions))
     total = len(images)
     progress(0, total)
     if total == 0:
@@ -338,96 +320,6 @@ def _prepare_save_image(
     return out
 
 
-def process_manual_crop(
-    cfg: ManualCropConfig,
-    log: Callable[[str], None],
-    progress: Callable[[int, int], None],
-    is_cancelled: Callable[[], bool],
-) -> dict:
-    source_root = Path(cfg.source_dir).resolve()
-    if not source_root.exists() or not source_root.is_dir():
-        raise RuntimeError("素材目录不存在或不是文件夹。")
-
-    exclude_roots: list[Path] = []
-    if cfg.use_exclude_dirs:
-        for s in cfg.excluded_paths:
-            t = s.strip()
-            if not t:
-                continue
-            p = Path(t)
-            if p.exists() and p.is_dir():
-                exclude_roots.append(p.resolve())
-
-    images = list(iter_image_files(source_root, cfg.recursive, exclude_roots))
-    total = len(images)
-    progress(0, total)
-    if total == 0:
-        log("没有找到可处理的图片。")
-        return {
-            "total": 0,
-            "resized": 0,
-            "skipped_size_ok": 0,
-            "errors": 0,
-            "cancelled": False,
-        }
-
-    stats = {
-        "total": total,
-        "resized": 0,
-        "skipped_size_ok": 0,
-        "errors": 0,
-        "cancelled": False,
-    }
-    pad = cfg.padding_color if cfg.padding_color in ("black", "white", "transparent") else "black"
-    jpg_warned = [False]
-
-    for idx, image_path in enumerate(images, start=1):
-        if is_cancelled():
-            stats["cancelled"] = True
-            log("用户取消任务。")
-            break
-
-        try:
-            with Image.open(image_path) as img:
-                original_fmt = img.format
-                iw, ih = img.size
-                left = max(0, min(cfg.crop_x, iw))
-                top = max(0, min(cfg.crop_y, ih))
-                right = min(iw, cfg.crop_x + cfg.crop_w)
-                bottom = min(ih, cfg.crop_y + cfg.crop_h)
-                if right <= left or bottom <= top:
-                    stats["errors"] += 1
-                    log(f"[跳过] {image_path.name}: 裁剪区域与图像无交集或无效。")
-                    progress(idx, total)
-                    continue
-
-                cropped = img.crop((left, top, right, bottom))
-                out = cropped
-                if cfg.after_scale:
-                    tw, th = cfg.target_width, cfg.target_height
-                    if cropped.size != (tw, th):
-                        out = resize_with_padding(cropped, tw, th, pad)
-                    else:
-                        stats["skipped_size_ok"] += 1
-
-                save_kwargs: dict = {}
-                out = _prepare_save_image(out, image_path, original_fmt, pad, log, jpg_warned)
-                if original_fmt:
-                    out.save(image_path, format=original_fmt, **save_kwargs)
-                else:
-                    out.save(image_path, **save_kwargs)
-                stats["resized"] += 1
-        except Exception as exc:
-            stats["errors"] += 1
-            log(f"[失败] {image_path.name}: {exc}")
-
-        progress(idx, total)
-        if idx % 10 == 0 or idx == total:
-            log(f"处理进度: {idx}/{total}")
-
-    return stats
-
-
 def presets_path() -> Path:
     return Path(__file__).resolve().parent / PRESETS_FILE
 
@@ -439,8 +331,6 @@ def load_presets_store() -> dict:
         "presets": {},
         "size_presets": {},
         "last_size_preset": "",
-        "last_process_mode": 0,
-        "manual_crop": {},
     }
     if not p.exists():
         return out
@@ -458,15 +348,6 @@ def load_presets_store() -> dict:
     out["size_presets"] = size_presets if isinstance(size_presets, dict) else {}
     ls = data.get("last_size_preset", "")
     out["last_size_preset"] = ls if isinstance(ls, str) else ""
-    lm = data.get("last_process_mode", 0)
-    if isinstance(lm, bool) or lm is None:
-        out["last_process_mode"] = 0
-    elif isinstance(lm, (int, float)):
-        out["last_process_mode"] = max(0, min(1, int(lm)))
-    else:
-        out["last_process_mode"] = 0
-    mc = data.get("manual_crop")
-    out["manual_crop"] = mc if isinstance(mc, dict) else {}
     return out
 
 
@@ -499,12 +380,6 @@ def save_full_store(store: dict) -> None:
         "last_size_preset": store.get("last_size_preset", "")
         if isinstance(store.get("last_size_preset"), str)
         else "",
-        "last_process_mode": int(store.get("last_process_mode", 0))
-        if isinstance(store.get("last_process_mode"), (int, float))
-        else 0,
-        "manual_crop": store.get("manual_crop", {})
-        if isinstance(store.get("manual_crop"), dict)
-        else {},
     }
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -516,7 +391,9 @@ class MainWindow(QMainWindow):
         self.resize(820, 720)
 
         self.thread: QThread | None = None
-        self.worker: Worker | ManualCropWorker | None = None
+        self.worker: Worker | None = None
+        # 上次在对话框中打开的目录仍存在时，用作下次「选择文件夹/选择图片」的起始路径
+        self._dialog_start_dir: str | None = None
 
         self.source_input = QLineEdit()
         self.browse_btn = QPushButton("选择目录")
@@ -561,12 +438,12 @@ class MainWindow(QMainWindow):
         self.delete_size_preset_btn = QPushButton("删除所选比例")
         self.delete_size_preset_btn.clicked.connect(self.delete_selected_size_preset)
 
-        self.exclude_enable = QCheckBox("排除所选文件夹及其内图片")
+        self.exclude_enable = QCheckBox("排除所选文件夹/图片")
         self.exclude_rows_host = QWidget()
         self._exclude_layout = QVBoxLayout(self.exclude_rows_host)
         self._exclude_layout.setContentsMargins(0, 0, 0, 0)
         self._exclude_row_edits: list[QLineEdit] = []
-        self.add_exclude_row_btn = QPushButton("➕ 添加排除目录行")
+        self.add_exclude_row_btn = QPushButton("+ 添加排除路径行")
         self.add_exclude_row_btn.clicked.connect(lambda: self._add_exclude_row(""))
 
         self.recursive_checkbox = QCheckBox("递归处理子目录")
@@ -580,41 +457,6 @@ class MainWindow(QMainWindow):
         self.pad_group.addButton(self.pad_black)
         self.pad_group.addButton(self.pad_white)
         self.pad_group.addButton(self.pad_transparent)
-
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["自动", "手动"])
-        self.mode_combo.currentIndexChanged.connect(self._on_process_mode_changed)
-
-        self.manual_crop_x = QSpinBox()
-        self.manual_crop_x.setRange(0, 16384)
-        self.manual_crop_y = QSpinBox()
-        self.manual_crop_y.setRange(0, 16384)
-        self.manual_crop_w = QSpinBox()
-        self.manual_crop_w.setRange(1, 16384)
-        self.manual_crop_w.setValue(512)
-        self.manual_crop_h = QSpinBox()
-        self.manual_crop_h.setRange(1, 16384)
-        self.manual_crop_h.setValue(512)
-
-        self.manual_after_scale = QCheckBox("裁剪后再缩放补边")
-        self.manual_target_panel = QWidget()
-        self.manual_tw = QSpinBox()
-        self.manual_tw.setRange(64, 8192)
-        self.manual_tw.setMaximumWidth(100)
-        self.manual_tw.setValue(768)
-        self.manual_th = QSpinBox()
-        self.manual_th.setRange(64, 8192)
-        self.manual_th.setMaximumWidth(100)
-        self.manual_th.setValue(1344)
-        self.manual_pad_black = QRadioButton("黑边")
-        self.manual_pad_white = QRadioButton("白边")
-        self.manual_pad_transparent = QRadioButton("透明边")
-        self.manual_pad_black.setChecked(True)
-        self.manual_pad_group = QButtonGroup(self)
-        self.manual_pad_group.addButton(self.manual_pad_black)
-        self.manual_pad_group.addButton(self.manual_pad_white)
-        self.manual_pad_group.addButton(self.manual_pad_transparent)
-        self.manual_after_scale.toggled.connect(self._on_manual_after_scale_toggled)
 
         self.run_btn = QPushButton("开始处理")
         self.cancel_btn = QPushButton("取消")
@@ -651,16 +493,7 @@ class MainWindow(QMainWindow):
         self._refresh_preset_combo()
         self._refresh_size_preset_combo()
         self._load_startup_preset()
-        self._load_manual_from_store()
         self._on_exclude_toggled(self.exclude_enable.isChecked())
-        self._on_manual_after_scale_toggled(self.manual_after_scale.isChecked())
-        store = load_presets_store()
-        idx = int(store.get("last_process_mode", 0))
-        idx = max(0, min(1, idx))
-        self.mode_combo.blockSignals(True)
-        self.mode_combo.setCurrentIndex(idx)
-        self.mode_combo.blockSignals(False)
-        self.stack.setCurrentIndex(idx)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -681,20 +514,12 @@ class MainWindow(QMainWindow):
         ex_wrap.addWidget(self.add_exclude_row_btn)
         ex_w = QWidget()
         ex_w.setLayout(ex_wrap)
-        scan_form.addRow("排除目录:", ex_w)
+        scan_form.addRow("排除路径:", ex_w)
         scan_form.addRow("", self.recursive_checkbox)
         layout.addWidget(scan_group)
 
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("模式:"))
-        mode_row.addWidget(self.mode_combo)
-        mode_row.addStretch()
-        layout.addLayout(mode_row)
-
-        self.stack = QStackedWidget()
-
-        page_auto = QWidget()
-        la = QVBoxLayout(page_auto)
+        auto_panel = QWidget()
+        la = QVBoxLayout(auto_panel)
         base_group = QGroupBox("自动处理")
         base_form = QFormLayout(base_group)
         sz_pr = QHBoxLayout()
@@ -774,47 +599,7 @@ class MainWindow(QMainWindow):
         pg.addLayout(preset_row2)
         la.addWidget(preset_group)
         la.addStretch(1)
-        self.stack.addWidget(page_auto)
-
-        page_manual = QWidget()
-        lm = QVBoxLayout(page_manual)
-        manual_group = QGroupBox("手动")
-        mf = QFormLayout(manual_group)
-        crop_row = QHBoxLayout()
-        crop_row.addWidget(QLabel("左"))
-        crop_row.addWidget(self.manual_crop_x)
-        crop_row.addWidget(QLabel("上"))
-        crop_row.addWidget(self.manual_crop_y)
-        crop_row.addWidget(QLabel("宽"))
-        crop_row.addWidget(self.manual_crop_w)
-        crop_row.addWidget(QLabel("高"))
-        crop_row.addWidget(self.manual_crop_h)
-        crop_row.addStretch(1)
-        cw = QWidget()
-        cw.setLayout(crop_row)
-        mf.addRow("裁剪区（px，左上原点）:", cw)
-        hint = QLabel("越界自动截断；与图无交集则跳过。")
-        hint.setWordWrap(True)
-        mf.addRow("", hint)
-        mf.addRow("", self.manual_after_scale)
-        mt_layout = QVBoxLayout(self.manual_target_panel)
-        mt_layout.setContentsMargins(0, 0, 0, 0)
-        mt_layout.addWidget(compact_wh_row(self.manual_tw, self.manual_th))
-        mp_row = QHBoxLayout()
-        mp_row.addWidget(QLabel("补边:"))
-        mp_row.addWidget(self.manual_pad_black)
-        mp_row.addWidget(self.manual_pad_white)
-        mp_row.addWidget(self.manual_pad_transparent)
-        mp_row.addStretch(1)
-        mpw = QWidget()
-        mpw.setLayout(mp_row)
-        mt_layout.addWidget(mpw)
-        mf.addRow("再缩放至:", self.manual_target_panel)
-        lm.addWidget(manual_group)
-        lm.addStretch(1)
-        self.stack.addWidget(page_manual)
-
-        layout.addWidget(self.stack, 1)
+        layout.addWidget(auto_panel, 1)
 
         action_row = QHBoxLayout()
         action_row.addWidget(self.run_btn)
@@ -838,74 +623,6 @@ class MainWindow(QMainWindow):
         self.split_size_widget.setVisible(not unified)
         self._size_mode_hint.setVisible(not unified)
 
-    def _on_process_mode_changed(self, idx: int) -> None:
-        self.stack.setCurrentIndex(max(0, min(self.stack.count() - 1, idx)))
-
-    def _on_manual_after_scale_toggled(self, on: bool) -> None:
-        self.manual_target_panel.setVisible(on)
-
-    def _manual_crop_to_dict(self) -> dict:
-        if self.manual_pad_transparent.isChecked():
-            pad = "transparent"
-        elif self.manual_pad_white.isChecked():
-            pad = "white"
-        else:
-            pad = "black"
-        return {
-            "crop_x": self.manual_crop_x.value(),
-            "crop_y": self.manual_crop_y.value(),
-            "crop_w": self.manual_crop_w.value(),
-            "crop_h": self.manual_crop_h.value(),
-            "after_scale": self.manual_after_scale.isChecked(),
-            "target_width": self.manual_tw.value(),
-            "target_height": self.manual_th.value(),
-            "padding_color": pad,
-        }
-
-    def _load_manual_from_store(self) -> None:
-        mc = load_presets_store().get("manual_crop", {})
-        if not isinstance(mc, dict):
-            return
-        try:
-            self.manual_crop_x.setValue(int(mc.get("crop_x", 0)))
-            self.manual_crop_y.setValue(int(mc.get("crop_y", 0)))
-            self.manual_crop_w.setValue(max(1, int(mc.get("crop_w", 512))))
-            self.manual_crop_h.setValue(max(1, int(mc.get("crop_h", 512))))
-            self.manual_after_scale.setChecked(bool(mc.get("after_scale", False)))
-            self.manual_tw.setValue(int(mc.get("target_width", 768)))
-            self.manual_th.setValue(int(mc.get("target_height", 1344)))
-            p = str(mc.get("padding_color", "black"))
-            if p == "transparent":
-                self.manual_pad_transparent.setChecked(True)
-            elif p == "white":
-                self.manual_pad_white.setChecked(True)
-            else:
-                self.manual_pad_black.setChecked(True)
-        except (TypeError, ValueError):
-            pass
-
-    def get_manual_config(self) -> ManualCropConfig:
-        if self.manual_pad_transparent.isChecked():
-            pad = "transparent"
-        elif self.manual_pad_white.isChecked():
-            pad = "white"
-        else:
-            pad = "black"
-        return ManualCropConfig(
-            source_dir=self.source_input.text().strip(),
-            crop_x=self.manual_crop_x.value(),
-            crop_y=self.manual_crop_y.value(),
-            crop_w=self.manual_crop_w.value(),
-            crop_h=self.manual_crop_h.value(),
-            use_exclude_dirs=self.exclude_enable.isChecked(),
-            excluded_paths=self._collect_excluded_paths(),
-            recursive=self.recursive_checkbox.isChecked(),
-            after_scale=self.manual_after_scale.isChecked(),
-            target_width=self.manual_tw.value(),
-            target_height=self.manual_th.value(),
-            padding_color=pad,
-        )
-
     def _clear_exclude_rows(self) -> None:
         while self._exclude_layout.count():
             item = self._exclude_layout.takeAt(0)
@@ -913,29 +630,63 @@ class MainWindow(QMainWindow):
                 item.widget().deleteLater()
         self._exclude_row_edits.clear()
 
+    def _apply_sorted_exclude_selection(self, trigger_edit: QLineEdit, raw_paths: list[str]) -> None:
+        paths = _sorted_exclude_pick_paths(raw_paths)
+        if not paths:
+            return
+        trigger_edit.setText(paths[0])
+        pending = paths[1:]
+        for edit in self._exclude_row_edits:
+            if not pending:
+                break
+            if edit is trigger_edit:
+                continue
+            if not edit.text().strip():
+                edit.setText(pending.pop(0))
+        for p in pending:
+            self._add_exclude_row(p)
+
     def _add_exclude_row(self, path: str) -> None:
         row = QWidget()
         h = QHBoxLayout(row)
         h.setContentsMargins(0, 0, 0, 0)
         edit = QLineEdit()
         edit.setText(path)
-        edit.setPlaceholderText("选择要排除的文件夹…")
-        btn = QPushButton("浏览…")
+        edit.setPlaceholderText("文件夹路径或图片文件路径…")
+        folder_btn = QPushButton("选择文件夹…")
+        file_btn = QPushButton("选择图片…")
         del_btn = QPushButton("删除")
 
-        def browse() -> None:
-            start = edit.text().strip() or self.source_input.text().strip() or str(Path.cwd())
+        def browse_folder() -> None:
+            start = self._dialog_directory_start(edit.text())
             folder = QFileDialog.getExistingDirectory(self, "选择要排除的目录", start)
             if folder:
+                self._remember_dialog_directory(folder)
                 edit.setText(folder)
+
+        def browse_files() -> None:
+            start = self._dialog_directory_start(edit.text())
+            if not os.path.isdir(start):
+                start = str(Path(start).resolve().parent if os.path.isfile(start) else Path.cwd())
+            files, _ = QFileDialog.getOpenFileNames(
+                self,
+                "选择要排除的图片（可多选）",
+                start,
+                "图片文件 (*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff);;所有文件 (*.*)",
+            )
+            if files:
+                self._remember_dialog_directory(os.path.dirname(os.path.abspath(files[0])))
+                self._apply_sorted_exclude_selection(edit, list(files))
 
         def remove() -> None:
             self._remove_exclude_row(edit)
 
-        btn.clicked.connect(browse)
+        folder_btn.clicked.connect(browse_folder)
+        file_btn.clicked.connect(browse_files)
         del_btn.clicked.connect(remove)
         h.addWidget(edit)
-        h.addWidget(btn)
+        h.addWidget(folder_btn)
+        h.addWidget(file_btn)
         h.addWidget(del_btn)
         self._exclude_layout.addWidget(row)
         self._exclude_row_edits.append(edit)
@@ -1232,9 +983,35 @@ class MainWindow(QMainWindow):
         self._refresh_preset_combo()
         self.append_log(f"已删除预设: {name}")
 
+    def _remember_dialog_directory(self, path: str) -> None:
+        p = os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+        if os.path.isdir(p):
+            self._dialog_start_dir = p
+
+    def _dialog_directory_start(self, field_hint: str = "") -> str:
+        d = self._dialog_start_dir
+        if d and os.path.isdir(d):
+            return d
+        for s in (field_hint.strip(), self.source_input.text().strip()):
+            if not s:
+                continue
+            s = os.path.normpath(os.path.abspath(os.path.expanduser(s)))
+            if os.path.isdir(s):
+                return s
+            if os.path.isfile(s):
+                parent = os.path.dirname(s)
+                if parent and os.path.isdir(parent):
+                    return parent
+        return str(Path.cwd().resolve())
+
     def select_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "选择素材目录", self.source_input.text() or str(Path.cwd()))
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择素材目录",
+            self._dialog_directory_start(self.source_input.text()),
+        )
         if folder:
+            self._remember_dialog_directory(folder)
             self.source_input.setText(folder)
 
     def append_log(self, text: str) -> None:
@@ -1246,35 +1023,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "提示", "请先选择素材目录。")
             return
 
-        if self.mode_combo.currentIndex() == 0:
-            cfg = self.get_config()
-            if not cfg.resize_images:
-                QMessageBox.warning(self, "提示", "请勾选「处理图片尺寸」。")
+        cfg = self.get_config()
+        if not cfg.resize_images:
+            QMessageBox.warning(self, "提示", "请勾选「等比缩放并补边」。")
+            return
+        if cfg.use_exclude_dirs:
+            bad = [p for p in cfg.excluded_paths if p and not Path(p).exists()]
+            if bad:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    "以下排除路径不存在，请检查:\n" + "\n".join(bad[:8]),
+                )
                 return
-            if cfg.use_exclude_dirs:
-                bad = [p for p in cfg.excluded_paths if p and (not Path(p).exists() or not Path(p).is_dir())]
-                if bad:
-                    QMessageBox.warning(
-                        self,
-                        "提示",
-                        "以下排除路径不是有效文件夹，请检查或关闭「启用排除目录」:\n" + "\n".join(bad[:8]),
-                    )
-                    return
-            self.append_log("开始：自动…")
-            self.worker = Worker(cfg)
-        else:
-            mcfg = self.get_manual_config()
-            if mcfg.use_exclude_dirs:
-                bad = [p for p in mcfg.excluded_paths if p and (not Path(p).exists() or not Path(p).is_dir())]
-                if bad:
-                    QMessageBox.warning(
-                        self,
-                        "提示",
-                        "以下排除路径不是有效文件夹，请检查或关闭「启用排除目录」:\n" + "\n".join(bad[:8]),
-                    )
-                    return
-            self.append_log("开始：手动…")
-            self.worker = ManualCropWorker(mcfg)
+        self.append_log("开始：自动批量处理…")
+        self.worker = Worker(cfg)
 
         self.run_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
@@ -1335,8 +1098,6 @@ class MainWindow(QMainWindow):
         sp = store.get("size_presets", {})
         if sz and isinstance(sp, dict) and sz in sp:
             store["last_size_preset"] = sz
-        store["last_process_mode"] = self.mode_combo.currentIndex()
-        store["manual_crop"] = self._manual_crop_to_dict()
         save_full_store(store)
         super().closeEvent(event)
 
