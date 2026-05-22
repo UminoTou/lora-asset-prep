@@ -2,12 +2,14 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from PIL import Image
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QObject, QThread, Qt, Signal
+from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -19,6 +21,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -56,7 +59,7 @@ APP_REPO_SLUG = "lora-asset-prep"
 
 @dataclass
 class AppConfig:
-    source_dir: str = ""
+    source_paths: list[str] = field(default_factory=list)
     target_width: int = 768
     target_height: int = 1344
     split_long_wide: bool = False
@@ -156,6 +159,81 @@ def iter_image_files(
             yield p
 
 
+def _normalized_unique_paths(paths: Iterable[str]) -> list[str]:
+    """仅保留磁盘上存在的路径，绝对规范化、去重并保持首次出现顺序。"""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in paths:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        ap = os.path.normpath(os.path.abspath(os.path.expanduser(s)))
+        if not os.path.exists(ap):
+            continue
+        try:
+            key = str(Path(ap).resolve()).lower()
+        except OSError:
+            key = ap.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(ap)
+    return out
+
+
+def collect_process_image_paths(cfg: AppConfig) -> tuple[list[Path], list[str]]:
+    """枚举待处理图片（可多根目录或多文件）；第二项为人类可读错误信息列表。"""
+    exclusions: list[Path] = []
+    if cfg.use_exclude_dirs:
+        for s in cfg.excluded_paths:
+            t = s.strip()
+            if not t:
+                continue
+            p = Path(t)
+            if p.exists():
+                exclusions.append(p.resolve())
+
+    roots_raw = [str(x).strip() for x in cfg.source_paths if str(x).strip()]
+    if not roots_raw:
+        return [], ["请先添加至少一个素材文件夹或图片文件。"]
+
+    missing = [rs for rs in roots_raw if not Path(rs).exists()]
+    if missing:
+        msgs = [f"{len(missing)} 个素材路径不存在："] + missing[:12]
+        if len(missing) > 12:
+            msgs.append("…")
+        return [], msgs
+
+    seen_k: set[str] = set()
+    basket: list[Path] = []
+    for rs in roots_raw:
+        root = Path(rs)
+        try:
+            r = root.resolve()
+        except OSError:
+            continue
+        if r.is_file():
+            if r.suffix.lower() not in IMAGE_EXTS:
+                continue
+            if exclusions and path_matches_exclusion(r, exclusions):
+                continue
+            k = str(r).lower()
+            if k not in seen_k:
+                seen_k.add(k)
+                basket.append(r)
+        elif r.is_dir():
+            for p in iter_image_files(r, cfg.recursive, exclusions):
+                try:
+                    kr = str(p.resolve()).lower()
+                except OSError:
+                    kr = str(p).lower()
+                if kr not in seen_k:
+                    seen_k.add(kr)
+                    basket.append(p)
+
+    basket.sort(key=lambda fp: tuple(x.lower() for x in fp.parts))
+    return basket, []
+
+
 def pick_target_size(img_w: int, img_h: int, cfg: AppConfig) -> tuple[int, int]:
     if not cfg.split_long_wide:
         return cfg.target_width, cfg.target_height
@@ -209,7 +287,15 @@ def resize_with_padding(
 def _config_from_dict(raw: dict) -> AppConfig:
     defaults = asdict(AppConfig())
     merged = {**defaults, **raw}
-    for k in ("replace_from", "replace_to", "replace_tags", "jpeg_quality", "excluded_dirs"):
+    legacy_dir = merged.get("source_dir", "") if isinstance(merged.get("source_dir"), str) else ""
+    sp = merged.get("source_paths")
+    if isinstance(sp, list):
+        merged["source_paths"] = [str(x).strip() for x in sp if str(x).strip()]
+    else:
+        merged["source_paths"] = []
+    if not merged["source_paths"] and legacy_dir.strip():
+        merged["source_paths"] = [legacy_dir.strip()]
+    for k in ("replace_from", "replace_to", "replace_tags", "jpeg_quality", "excluded_dirs", "source_dir"):
         merged.pop(k, None)
     fields = set(defaults.keys())
     cfg_dict = {k: merged[k] for k in fields if k in merged}
@@ -228,21 +314,10 @@ def process_dataset(
     progress: Callable[[int, int], None],
     is_cancelled: Callable[[], bool],
 ) -> dict:
-    source_root = Path(cfg.source_dir).resolve()
-    if not source_root.exists() or not source_root.is_dir():
-        raise RuntimeError("素材目录不存在或不是文件夹。")
+    images, errs = collect_process_image_paths(cfg)
+    if errs:
+        raise RuntimeError("\n".join(errs))
 
-    exclusions: list[Path] = []
-    if cfg.use_exclude_dirs:
-        for s in cfg.excluded_paths:
-            t = s.strip()
-            if not t:
-                continue
-            p = Path(t)
-            if p.exists():
-                exclusions.append(p.resolve())
-
-    images = list(iter_image_files(source_root, cfg.recursive, exclusions))
     total = len(images)
     progress(0, total)
     if total == 0:
@@ -274,20 +349,32 @@ def process_dataset(
 
         try:
             if cfg.resize_images:
+                resized: Image.Image | None = None
+                original_fmt: str | None = None
                 with Image.open(image_path) as img:
                     original_fmt = img.format
                     tw, th = pick_target_size(*img.size, cfg)
                     if img.size == (tw, th):
-                        stats["skipped_size_ok"] += 1
+                        resized = None
                     else:
-                        out = resize_with_padding(img, tw, th, pad)
-                        save_kwargs: dict = {}
-                        out = _prepare_save_image(out, image_path, original_fmt, pad, log, jpg_warned)
-                        if original_fmt:
-                            out.save(image_path, format=original_fmt, **save_kwargs)
-                        else:
-                            out.save(image_path, **save_kwargs)
-                        stats["resized"] += 1
+                        resized = resize_with_padding(img.copy(), tw, th, pad)
+                if resized is None:
+                    stats["skipped_size_ok"] += 1
+                else:
+                    save_kwargs: dict = {}
+                    resized = _prepare_save_image(
+                        resized,
+                        image_path,
+                        original_fmt,
+                        pad,
+                        log,
+                        jpg_warned,
+                    )
+                    if original_fmt:
+                        resized.save(image_path, format=original_fmt, **save_kwargs)
+                    else:
+                        resized.save(image_path, **save_kwargs)
+                    stats["resized"] += 1
         except Exception as exc:
             stats["errors"] += 1
             log(f"[失败] {image_path.name}: {exc}")
@@ -384,6 +471,42 @@ def save_full_store(store: dict) -> None:
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class SourcePathsList(QListWidget):
+    pathsDropped = Signal(list)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setMinimumHeight(115)
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDropIndicatorShown(True)
+        self.setToolTip("将文件夹或多位图片拖入此处，或点击下方按钮批量添加。\n可多选条目后点「移除所选」。")
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event: QDragMoveEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            raw = [u.toLocalFile().strip() for u in event.mimeData().urls() if u.isLocalFile()]
+            paths = [p for p in raw if p]
+            if paths:
+                self.pathsDropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -395,9 +518,16 @@ class MainWindow(QMainWindow):
         # 上次在对话框中打开的目录仍存在时，用作下次「选择文件夹/选择图片」的起始路径
         self._dialog_start_dir: str | None = None
 
-        self.source_input = QLineEdit()
-        self.browse_btn = QPushButton("选择目录")
-        self.browse_btn.clicked.connect(self.select_folder)
+        self.source_list = SourcePathsList(self)
+        self.source_list.pathsDropped.connect(self._on_sources_dropped)
+        self.add_sources_folder_btn = QPushButton("添加文件夹…")
+        self.add_sources_folder_btn.clicked.connect(self.select_sources_folder)
+        self.add_sources_files_btn = QPushButton("添加图片…")
+        self.add_sources_files_btn.clicked.connect(self.select_sources_files)
+        self.remove_sources_btn = QPushButton("移除所选")
+        self.remove_sources_btn.clicked.connect(self._remove_selected_sources)
+        self.clear_sources_btn = QPushButton("清空素材")
+        self.clear_sources_btn.clicked.connect(self._clear_sources_list)
 
         self.width_input = QSpinBox()
         self.width_input.setRange(64, 8192)
@@ -500,11 +630,15 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
 
-        source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("素材目录:"))
-        source_row.addWidget(self.source_input)
-        source_row.addWidget(self.browse_btn)
-        layout.addLayout(source_row)
+        layout.addWidget(QLabel("素材（可多选文件夹与图片，支持从资源管理器拖入）："))
+        src_btns = QHBoxLayout()
+        src_btns.addWidget(self.add_sources_folder_btn)
+        src_btns.addWidget(self.add_sources_files_btn)
+        src_btns.addWidget(self.remove_sources_btn)
+        src_btns.addWidget(self.clear_sources_btn)
+        src_btns.addStretch()
+        layout.addLayout(src_btns)
+        layout.addWidget(self.source_list)
 
         scan_group = QGroupBox("扫描范围")
         scan_form = QFormLayout(scan_group)
@@ -702,6 +836,77 @@ class MainWindow(QMainWindow):
         if not self._exclude_row_edits:
             self._add_exclude_row("")
 
+    def _first_source_hint(self) -> str:
+        if self.source_list.count() >= 1:
+            return self.source_list.item(0).text().strip()
+        return ""
+
+    def _path_row_key(self, path_str: str) -> str:
+        try:
+            return str(Path(path_str.strip()).resolve()).lower()
+        except OSError:
+            return os.path.normpath(path_str).lower()
+
+    def _existing_source_keys(self) -> set[str]:
+        keys: set[str] = set()
+        for i in range(self.source_list.count()):
+            t = self.source_list.item(i).text().strip()
+            if t:
+                keys.add(self._path_row_key(t))
+        return keys
+
+    def _append_sources(self, paths: list[str]) -> None:
+        new = _normalized_unique_paths(paths)
+        if not new:
+            return
+        seen = self._existing_source_keys()
+        for ap in sorted(new, key=lambda fp: tuple(x.lower() for x in Path(fp).parts)):
+            k = self._path_row_key(ap)
+            if k in seen:
+                continue
+            seen.add(k)
+            self.source_list.addItem(ap)
+
+    def _on_sources_dropped(self, paths: list[str]) -> None:
+        n_before = self.source_list.count()
+        self._append_sources(paths)
+        if paths and self.source_list.count() == n_before:
+            QMessageBox.information(
+                self,
+                "提示",
+                "未能添加任何路径。\n可为文件夹或可识别扩展名的图片；已存在的重复项会自动跳过。",
+            )
+
+    def _remove_selected_sources(self) -> None:
+        rows = sorted({idx.row() for idx in self.source_list.selectedIndexes()}, reverse=True)
+        for row in rows:
+            self.source_list.takeItem(row)
+
+    def _clear_sources_list(self) -> None:
+        self.source_list.clear()
+
+    def select_sources_folder(self) -> None:
+        start = self._dialog_directory_start(self._first_source_hint())
+        folder = QFileDialog.getExistingDirectory(self, "添加素材文件夹", start)
+        if folder:
+            self._remember_dialog_directory(folder)
+            self._append_sources([folder])
+
+    def select_sources_files(self) -> None:
+        start = self._dialog_directory_start(self._first_source_hint())
+        if not os.path.isdir(start):
+            start = str(Path.cwd())
+        pairs = QFileDialog.getOpenFileNames(
+            self,
+            "添加素材图片（可多选）",
+            start,
+            "图片 (*.jpg *.jpeg *.png *.webp *.bmp *.gif *.tif *.tiff);;所有文件 (*)",
+        )
+        files = pairs[0]
+        if files:
+            self._remember_dialog_directory(os.path.dirname(os.path.abspath(files[0])))
+            self._append_sources(files)
+
     def _collect_excluded_paths(self) -> list[str]:
         return [e.text().strip() for e in self._exclude_row_edits if e.text().strip()]
 
@@ -713,7 +918,11 @@ class MainWindow(QMainWindow):
         else:
             pad = "black"
         return AppConfig(
-            source_dir=self.source_input.text().strip(),
+            source_paths=[
+                self.source_list.item(i).text().strip()
+                for i in range(self.source_list.count())
+                if self.source_list.item(i).text().strip()
+            ],
             target_width=self.width_input.value(),
             target_height=self.height_input.value(),
             split_long_wide=self.size_mode_split.isChecked(),
@@ -729,7 +938,11 @@ class MainWindow(QMainWindow):
         )
 
     def set_config(self, cfg: AppConfig) -> None:
-        self.source_input.setText(cfg.source_dir)
+        self.source_list.clear()
+        for p in cfg.source_paths:
+            pst = str(p).strip()
+            if pst:
+                self.source_list.addItem(pst)
         self.width_input.setValue(cfg.target_width)
         self.height_input.setValue(cfg.target_height)
         self.long_w_input.setValue(cfg.long_target_width)
@@ -992,7 +1205,7 @@ class MainWindow(QMainWindow):
         d = self._dialog_start_dir
         if d and os.path.isdir(d):
             return d
-        for s in (field_hint.strip(), self.source_input.text().strip()):
+        for s in (field_hint.strip(), self._first_source_hint()):
             if not s:
                 continue
             s = os.path.normpath(os.path.abspath(os.path.expanduser(s)))
@@ -1004,23 +1217,12 @@ class MainWindow(QMainWindow):
                     return parent
         return str(Path.cwd().resolve())
 
-    def select_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(
-            self,
-            "选择素材目录",
-            self._dialog_directory_start(self.source_input.text()),
-        )
-        if folder:
-            self._remember_dialog_directory(folder)
-            self.source_input.setText(folder)
-
     def append_log(self, text: str) -> None:
         self.log_box.appendPlainText(text)
 
     def start_task(self) -> None:
-        src = self.source_input.text().strip()
-        if not src:
-            QMessageBox.warning(self, "提示", "请先选择素材目录。")
+        if self.source_list.count() < 1:
+            QMessageBox.warning(self, "提示", "请先添加至少一个文件夹或素材图片（可拖放或多选）。")
             return
 
         cfg = self.get_config()
