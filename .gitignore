@@ -31,5 +31,11 @@ Desktop.ini
 .idea/
 .vscode/
 
-# Local / scratch (uncomment if you do not want presets in the repo)
+# Local / scratch
 # presets.json
+
+# Claude Code
+.claude/
+
+# Extra PyInstaller spec (main one is lora-asset-prep.spec)
+app.spec

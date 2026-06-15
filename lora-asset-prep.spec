@@ -5,8 +5,8 @@ a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[('presets.json', '.')],
+    hiddenimports=['PIL', 'PIL.Image'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -19,8 +19,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
+    a.binaries,
+    a.datas,
     [],
-    exclude_binaries=True,
     name='lora-asset-prep',
     debug=False,
     bootloader_ignore_signals=False,
@@ -32,13 +33,4 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-)
-coll = COLLECT(
-    exe,
-    a.binaries,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='lora-asset-prep',
 )

@@ -407,8 +407,15 @@ def _prepare_save_image(
     return out
 
 
+def _app_dir() -> Path:
+    """返回应用根目录，兼容 PyInstaller 打包和源码运行。"""
+    import sys as _sys
+    if getattr(_sys, 'frozen', False):
+        return Path(_sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
 def presets_path() -> Path:
-    return Path(__file__).resolve().parent / PRESETS_FILE
+    return _app_dir() / PRESETS_FILE
 
 
 def load_presets_store() -> dict:
